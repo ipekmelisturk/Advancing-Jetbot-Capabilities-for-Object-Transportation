@@ -1,0 +1,327 @@
+import rclpy
+import numpy as np
+import time
+import random
+import math 
+from PIL import Image, ImageDraw
+from rclpy.node import Node
+from std_msgs.msg import String
+from aruco_opencv_msgs.msg import ArucoDetection
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import OccupancyGrid
+from nav_msgs.srv import GetMap
+
+class MinimalPublisher(Node):
+
+    def __init__(self):
+            super().__init__('minimal_publisher')
+            self.subscription = self.create_subscription(
+                ArucoDetection,
+                'aruco_detections',
+                self.listener_callback,
+                10)
+
+            self.publisher = self.create_publisher( 
+                Twist, 
+                '/jetbot/cmd_vel', 
+                10)
+            
+            self.payload_secured = False
+            self.MAX_ITER_LIMIT = 10000
+            self.SUB_MAX_ITER_LIMIT = 1500  # For starting another RRT on the same Aruco
+            self.step_time = 0.5
+            self.current_goal_id = 5
+            self.proximity_distance = 30.0
+
+    def listener_callback(self, aruco_msg):
+        self.current_goal_id = 7 if self.payload_secured else 5  # Update current goal id
+        
+        found_current_goal_aruco = False
+        for marker in aruco_msg.markers:
+            if marker.marker_id == self.current_goal_id:
+                found_current_goal_aruco = True
+        if not found_current_goal_aruco:
+            print("Aruco of goal has not beed detected, looking around...")
+            msg = Twist()
+            msg.linear.x = 0.08
+            msg.angular.z = 0.5   
+            self.publisher.publish(msg)
+            time.sleep(self.step_time)     
+            msg.linear.x = 0.0
+            msg.angular.z = 0.0
+            self.publisher.publish(msg)
+            time.sleep(self.step_time)   
+        else:             
+            # Get the obstacle and goal distance 
+            distances,goal = self.extract_distances(aruco_msg)
+#             
+#                 self.payload_secured = True
+            
+            #print(f"goal point is: {goal[0]:.10f} ")
+            #print(f"goal point is: {goal[1]:.10f} ")
+            # Create the map
+            img = self.construct_map(distances,goal) # the map grid is created
+
+            # Starting point according to the image size (1000,1000)
+            start = (500, 1000)
+            
+            
+            # This part has taken from the Professor Vikas implementation of RRT
+            
+            # Specify the bounds of the map
+            pt_min = np.array([0, 0])
+            pt_max = np.array([img.shape[1], img.shape[0]])
+            stepsize = 1
+
+            # Dont stop until somewhere close to goal
+            # 1. Initialize an empty graph with the start point
+            G_adjacency_list = { start : [] }
+            print("Processing for RRT...")
+            for i in range(self.MAX_ITER_LIMIT):
+                if i % self.SUB_MAX_ITER_LIMIT == 0:
+                    # Mini limit
+                    G_adjacency_list = { start : [] }
+                if i % 100 == 0:
+                    print("Iter:", i)
+                # 2.a Sample points on the chosen area. 
+                random_pt = np.random.rand(2) * (pt_max - pt_min) + pt_min
+#                 print(f"random point is: {random_pt[0]:.10f} ")
+                nearest_pt, dist = self.closest_point_on_graph(G_adjacency_list, random_pt)
+
+                if np.linalg.norm(np.array(nearest_pt) - np.array(goal)) < self.proximity_distance: # Stop when distance to goal is reached
+                    print("Path to goal has been found in RRT")
+                    path = self.extract_path(G_adjacency_list, start, nearest_pt)
+                    #print("Path:", path)
+                    break
+
+                steps = int(np.floor(dist / stepsize))
+                if steps <= 0:
+                    continue
+                direction = (random_pt - nearest_pt) / np.linalg.norm(random_pt - nearest_pt)
+                all_points = np.arange(1, steps + 1)[:, None]*stepsize*direction+ nearest_pt[None, :]
+                collisions = self.do_points_collide(img, all_points)
+                if collisions[0]:
+                    continue
+                indices, = np.nonzero(collisions)
+                first_non_colliding = all_points[indices[0]-1] if len(indices)  else random_pt
+                G_adjacency_list.setdefault(
+                    tuple(nearest_pt.tolist()), []).append(tuple(first_non_colliding.tolist()))
+            
+            # Create the image
+            image = Image.fromarray(img)
+            draw = ImageDraw.Draw(image)
+            # Draw all RRT list
+            for vertex, neighbors in G_adjacency_list.items():
+                for neighbor in neighbors:
+                    draw.line([vertex, neighbor], fill=128)
+
+            for i in range(len(path) - 1):
+                draw.line([path[i], path[i + 1]], fill="red", width=3)
+
+            # Goal point
+            draw.rectangle([goal[0] - 5, goal[1] - 5, goal[0] + 5, goal[1] + 5],fill="black",outline ="red" )
+
+            # Save the image to look
+            image.save('map_with_RRT_image.jpg')
+#             print(G_adjacency_list)
+
+            # To move jetbot
+            x1 = path[0][0]/1000.0 
+            x2 = start[0]/1000.0
+            y1 = path[0][1]/1000.0 
+            y2 = start[1]/1000.0
+            distance = math.sqrt(abs((x1-x2)**2 - (y1-y2) **2)) 
+            theta=math.atan2((x1-x2), (y1-y2))
+
+
+            velocity = distance / self.step_time        # Distance is in terms of meters, step_time in terms of seconds
+            angular_velocity = theta / self.step_time   # Angular velocity in terms of radians per second
+
+            msg = Twist()
+            msg.linear.x = np.clip(-velocity,-0.1,0)
+            msg.angular.z = np.clip(angular_velocity,-0.5,0.5)    
+
+            self.publisher.publish(msg)
+            #Stop the Jetbot
+            time.sleep(self.step_time)                
+            msg.linear.x = 0.0
+            msg.angular.z = 0.0
+            self.publisher.publish(msg)
+            time.sleep(self.step_time)   
+            
+            for marker in aruco_msg.markers:
+                if marker.marker_id == self.current_goal_id:
+                    goal_distance = np.linalg.norm([marker.pose.position.x, marker.pose.position.z])
+                    if goal_distance < 0.2: # Goal has been reached (either payload or destination), TODO: Constant number here
+                        if not self.payload_secured:
+                            print("Payload reached, switching the goal to the destination now")
+                            self.payload_secured = True
+                        else:
+                            print("Payload has been delivered to the destination!!!")
+                            exit()
+         
+        
+    # Go from latest node to the start
+    def extract_path(self, G_adjacency_list, start, goal):
+        path = []
+        current_node = self.find_nearest_vertex(G_adjacency_list, goal)  # Start from the nearest point to the goal
+        while current_node != start:
+            path.append(current_node)
+            if current_node not in G_adjacency_list:
+#                 print("Error: Node not found in the graph.")  # TODO: Why is it printing this even though it is working?
+                break
+            current_node = G_adjacency_list[current_node][0]  # Assuming each node has only one parent
+        #path.append(start)
+#         print(path)
+        return path[::-1]  
+    def extract_angle_from_quaternion(self, quaternion):
+        # Extract yaw angle (rotation around the vertical axis)
+        x = quaternion.x
+        y = quaternion.y
+        z = quaternion.z
+        w = quaternion.w
+
+        sinr_cosp = 2 * (w * x + y * z)
+        cosr_cosp = 1 - 2 * (x * x + y * y)
+        roll = np.arctan2(sinr_cosp, cosr_cosp)
+
+        sinp = 2 * (w * y - z * x)
+        pitch = np.arcsin(sinp)
+
+        siny_cosp = 2 * (w * z + x * y)
+        cosy_cosp = 1 - 2 * (y * y + z * z)
+        yaw = np.arctan2(siny_cosp, cosy_cosp)
+        return yaw
+    # Get x,y,z from the markers
+    def extract_distances(self, aruco_msg):
+        distances = []
+        goal = []
+        for marker in aruco_msg.markers:
+#             print(f"Marker ID: {marker.marker_id}")
+            # The goal point
+            if marker.marker_id == self.current_goal_id:
+                goal_x = marker.pose.position.x *1000
+                goal_y = marker.pose.position.z *1000
+                goal = (int(500+goal_x),int(1000-goal_y))
+            else:
+                x = marker.pose.position.x *1000
+                y = marker.pose.position.y *1000
+                z = marker.pose.position.z *1000
+                angle = self.extract_angle_from_quaternion(marker.pose.orientation)
+                distances.append((x, y, z, angle))
+                #distances.append((x, y, z))
+            time.sleep(0.3)
+        return distances, goal
+    
+    def construct_map(self, distances, goal, filename='map_image.jpg'):
+        map_size = (1000, 1000)  # size of the map
+        map_grid = np.ones(map_size, dtype=np.uint8) *255 # Create one space
+        
+        for x,y,z,angle in distances:
+            cos_angle = np.cos(angle)
+            sin_angle = np.sin(angle)
+            # Check if the obstacle on the right side or left side. According to that create a wall until the vertical side of the image
+            if int(x + 500) < 500:
+                for i in range(int(x + 500), 0 ,-1):  
+                    for j in range(0, 20):
+                        j = int(j*cos_angle)
+                        map_grid[int(1000-z+j-50),int(i)] = 0 # if obstacle make it black
+            else:
+                for i in range(int(x + 500), 1000):  
+                    for j in range(0, 20):
+                        j = int(j*cos_angle)
+                        map_grid[int(1000-z+j-50),int(i)] = 0
+        image = Image.fromarray(map_grid)
+#         print(map_grid)
+        # Display the image
+        #image.show()
+        image.save('map_image.jpg')
+
+        return map_grid
+    
+    def do_points_collide(self, img, pts):
+        # threshold between white (255) and gray (100) color
+        threshold = 200
+        pts = np.round(pts).astype(dtype=np.int64)
+        in_img = ((0 <= pts) & (pts < np.array((img.shape[1], img.shape[0])))).all(axis=-1)
+        dummy_pts = pts.copy()
+        out_of_img = ~in_img
+        dummy_pts[~in_img] = 0
+        return (out_of_img) | (img[dummy_pts[..., 1], dummy_pts[..., 0]] < threshold)
+
+    def does_point_collide(self,img, pt):
+        return self.do_points_collide(img, pt)
+    
+    def find_nearest_vertex(self,G_adjacency_list, pt):
+        vertices = list(G_adjacency_list.keys())
+        vertices_np = np.asarray(vertices) # N x 2
+        diff_vec = (vertices_np - pt) # N x 2
+        dists_per_vec = np.sqrt((diff_vec**2).sum(axis=-1)) # N
+        closest_vertex = vertices[np.argmin(dists_per_vec)]
+        return closest_vertex
+    
+    def find_k_nearest_vertices(self,G_adjacency_list, pt, k=2):
+        vertices = list(G_adjacency_list.keys())
+        vertices_np = np.asarray(vertices) # N x 2
+        diff_vec = (vertices_np - pt) # N x 2
+        dists_per_vec = np.sqrt((diff_vec**2).sum(axis=-1)) # N
+        topk = np.argpartition(dists_per_vec, k)[:k]
+        closest_vertices = vertices_np[topk]
+        return closest_vertices
+    
+    def closest_point_on_line_segs(self,edges, pt):
+        assert edges.shape[-2] == 2
+        *N, _, D = edges.shape
+        vs, ve = edges[:, 0, :], edges[:, 1, :]
+        edge_vec = ve - vs # *N x D
+        edge_mag = np.linalg.norm(edge_vec, axis=-1, keepdims=True) #  *N 
+        edge_unit = edge_vec / edge_mag # *N x D
+        t = ((pt - vs) * edge_unit).sum(axis=-1, keepdims=True) # N x 1
+        x = vs + t * edge_unit # *N x D
+        dist_e = np.linalg.norm(pt - x, axis=-1)
+        dist_vs = np.linalg.norm(vs - pt, axis=-1)
+        dist_ve = np.linalg.norm(ve - pt, axis=-1)
+        is_pt_on_edge = ((0 <= t) & (t <= edge_mag))[..., 0]
+        dist_v = np.minimum(dist_vs, dist_ve)
+        dist = np.where( is_pt_on_edge,
+                        dist_e,
+                        dist_v)
+        min_idx = np.argmin(dist)
+        closest_point =  (x[min_idx]
+                          if is_pt_on_edge[min_idx] else vs[min_idx]
+                          if (dist_vs[min_idx] < dist_ve[min_idx]) else ve[min_idx])
+        return closest_point, dist[min_idx]
+
+    def closest_point_on_graph(self, G_adjacency_list, pt):
+        vertices = list(G_adjacency_list.keys())
+        edge_list = sum(
+            [[(v, n) 
+             for n in nbrs]
+             for v, nbrs in G_adjacency_list.items()], [])
+        if len(edge_list):
+            return self.closest_point_on_line_segs(np.array(edge_list), pt)
+        else:
+            verticesnp = np.array(vertices)
+            dists_v = np.linalg.norm(verticesnp - pt, axis=-1)
+            min_idx = np.argmin(dists_v)
+            closest_point_v = verticesnp[min_idx]
+            return closest_point_v, dists_v[min_idx]
+   
+        
+def main(args=None):
+
+        rclpy.init(args=args)
+
+        minimal_publisher = MinimalPublisher()
+       
+        rclpy.spin(minimal_publisher)
+        
+        minimal_publisher.destroy_node()
+
+        rclpy.shutdown()
+
+
+
+if __name__ == '__main__':
+
+        main()
